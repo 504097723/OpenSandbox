@@ -3,7 +3,7 @@ title: Credential Vault and Credential Proxy
 authors:
   - "@jwx0925"
 creation-date: 2026-05-28
-last-updated: 2026-05-28
+last-updated: 2026-06-02
 status: provisional
 ---
 
@@ -25,6 +25,7 @@ status: provisional
   - [API Schema](#api-schema)
   - [Binding Templates](#binding-templates)
   - [Credential Sources](#credential-sources)
+  - [Runtime Credential Mutations](#runtime-credential-mutations)
   - [Credential Injection](#credential-injection)
   - [Response Redaction and Echo Handling](#response-redaction-and-echo-handling)
   - [Runtime Modes](#runtime-modes)
@@ -62,13 +63,14 @@ to:
 ### Goals
 
 1. **Brokered credentials**: Let sandboxed workloads use credentials without receiving plaintext secret values through OpenSandbox-managed environment variables, files, lifecycle API responses, diagnostics, or logs.
-2. **Declarative binding**: Add a sandbox creation-time credential binding model that describes source, scope, and injection behavior, with operator-approved templates for common patterns.
+2. **Declarative binding**: Add a credential binding model that describes source, scope, and injection behavior at sandbox creation time or through authorized runtime mutations, with operator-approved templates for common patterns.
 3. **Policy-aware runtime injection**: Inject credentials only when sandbox identity, destination FQDN, HTTP method, and path all match the binding.
 4. **Egress alignment**: Integrate with `networkPolicy.egress` so credential scope and network reachability are consistent.
 5. **Runtime agnostic**: Support both Docker and Kubernetes through the existing egress sidecar pattern that shares the sandbox network namespace.
 6. **Transparent by default**: Use the existing egress transparent mitmproxy path as Credential Proxy so applications do not need proxy or base URL changes.
 7. **Auditable and redacted**: Emit useful audit events and metrics while redacting credential material from logs, diagnostics, and responses.
 8. **Backward compatible**: Keep existing sandbox creation and egress behavior unchanged unless credential bindings are explicitly requested.
+9. **Runtime mutation**: Let authorized control-plane callers add, replace, and delete sandbox credential bindings while the sandbox is running without exposing plaintext credentials to sandbox processes.
 
 ### Non-Goals
 
@@ -95,8 +97,10 @@ to:
 | R9 | Credential Proxy is default-deny for missing, invalid, or non-matching bindings | Must Have |
 | R10 | The runtime uses egress transparent mitmproxy as the Credential Proxy implementation | Must Have |
 | R11 | Credential-enabled egress startup fails closed when transparent redirect, mitm readiness, CA bootstrap, or egress API auth cannot be configured | Must Have |
-| R12 | Users can reference built-in or operator-configured binding templates instead of repeating full scope and injection rules | Should Have |
-| R13 | Future secret managers can be added through a provider interface | Should Have |
+| R12 | Authorized control-plane callers can add, replace, and delete credential bindings for a running sandbox | Must Have |
+| R13 | Runtime credential mutations are applied atomically by Credential Proxy with revision acknowledgement or fail without partial metadata/runtime drift | Must Have |
+| R14 | Users can reference built-in or operator-configured binding templates instead of repeating full scope and injection rules | Should Have |
+| R15 | Future secret managers can be added through a provider interface | Should Have |
 
 ## Proposal
 
@@ -111,6 +115,8 @@ The first implementation supports **transparent proxy mode**:
 5. Credential Proxy evaluates the intercepted request against the sandbox credential bindings, including scheme and port.
 6. If exactly one binding matches and policy allows the request, Credential Proxy fetches or receives the credential material from a trusted source path and injects it into the request.
 7. The external service receives the credential-bearing request; the sandbox process only sees the service response.
+
+The MVP also supports runtime credential mutation through the lifecycle control plane. After a sandbox is running, an authorized caller may add, replace, or delete a sandbox-local credential binding. The server validates the mutation against the same template, scope, egress, intercept-port, ambiguity, and redaction rules used at sandbox creation time, prepares sandbox-scoped runtime material, and asks Credential Proxy to atomically load a new binding revision. The mutation succeeds only after Credential Proxy acknowledges the revision; otherwise the previous binding revision remains active.
 
 At a high level:
 
@@ -151,6 +157,7 @@ At a high level:
 5. **Binding scope must be covered by egress scope**: A credential-enabled sandbox must include `networkPolicy.egress`, and every credential binding target must be covered by an allow rule. Missing or inconsistent egress policy fails sandbox creation.
 6. **Multiple matching bindings are ambiguous**: If more than one binding matches a request and no deterministic precedence is declared, Credential Proxy must fail closed.
 7. **Upstream echo is outside the absolute secrecy guarantee**: OpenSandbox prevents its own control plane and runtime surfaces from exposing credentials, but an upstream service can still echo request headers in response bodies or headers. Credential Proxy should redact known credential values from responses where practical, and users should avoid binding credentials to services that echo sensitive request headers.
+8. **Runtime mutations are control-plane only**: Sandbox application processes must not receive permission or credentials to add, update, delete, or inspect Credential Vault bindings. Runtime mutation APIs are intended for authenticated OpenSandbox clients, platform services, and operators outside the sandbox trust boundary.
 
 ### Risks and Mitigations
 
@@ -173,6 +180,8 @@ At a high level:
 | Platform credential authorized for wrong destination | An operator-managed credential is injected into an attacker-controlled target | Do not expose platform credential sources as user-selectable source refs. Operator templates that use platform credentials must constrain allowed targets, methods, paths, schemes, ports, and injection renderings. |
 | Multiple bindings match one request | Wrong credential injection | Fail closed unless a single highest-priority binding is configured |
 | Long-lived credentials remain in proxy memory | Expanded exposure window | Cache with TTL, zero buffers where practical, prefer short-lived tokens from providers |
+| Runtime mutation accepted but not loaded by proxy | Control plane and runtime disagree about which credentials are active | Treat mutations as revisioned transactions; do not report success until Credential Proxy acknowledges the new revision; keep the previous revision active on failure |
+| Sandbox process calls mutation API | Sandbox can bind credentials to attacker-controlled targets | Require lifecycle API authentication and authorization outside the sandbox, never expose mutation credentials or egress API tokens to the application container, and audit the caller identity |
 | Users expect full secret management | Product confusion | Document Credential Vault as a broker layer, not a standalone secret manager |
 
 ## Design Details
@@ -183,7 +192,7 @@ At a high level:
 - **Credential Proxy**: Credential-aware runtime behavior in the egress sidecar's transparent mitmproxy path. It evaluates outbound HTTP/HTTPS requests and injects credentials when policy matches.
 - **Credential Binding**: A per-sandbox declaration that connects a credential source to an allowed destination and injection rule.
 - **Credential Binding Template**: A built-in or operator-configured template that expands user parameters and a credential source into a full credential binding.
-- **Credential Source**: Credential material supplied to Credential Proxy. In the MVP public API this is an inline ephemeral value accepted only at sandbox creation time. Operator-managed credentials may exist behind operator-configured templates, but are not user-selectable source refs.
+- **Credential Source**: Credential material supplied to Credential Proxy. In the MVP public API this is an inline ephemeral value accepted only at sandbox creation time or through authorized runtime credential mutation APIs. Operator-managed credentials may exist behind operator-configured templates, but are not user-selectable source refs.
 - **Credential Injection**: The act of adding credential material to an outbound request, for example as an `Authorization` header.
 
 ### Architecture Overview
@@ -231,6 +240,29 @@ Authorization: Bearer <redacted>
 Extension to `specs/sandbox-lifecycle.yml`:
 
 ```yaml
+paths:
+  /sandboxes/{sandbox_id}/credential-vault/bindings:
+    get:
+      summary: List credential binding metadata for a sandbox.
+    post:
+      summary: Add a credential binding to a running sandbox.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialBindingMutationRequest'
+
+  /sandboxes/{sandbox_id}/credential-vault/bindings/{binding_name}:
+    put:
+      summary: Replace a credential binding on a running sandbox.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialBindingMutationRequest'
+    delete:
+      summary: Delete a credential binding from a running sandbox.
+
 components:
   schemas:
     CreateSandboxRequest:
@@ -251,6 +283,19 @@ components:
             $ref: '#/components/schemas/CredentialBinding'
       additionalProperties: false
 
+    CredentialVaultMutationResult:
+      type: object
+      required: [revision, bindings]
+      properties:
+        revision:
+          type: integer
+          description: Monotonic sandbox-local credential binding revision acknowledged by Credential Proxy.
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/CredentialBindingMetadata'
+      additionalProperties: false
+
     CredentialBinding:
       type: object
       required: [name]
@@ -264,6 +309,27 @@ components:
           $ref: '#/components/schemas/CredentialSourceRef'
         sourceRef:
           $ref: '#/components/schemas/CredentialSourceRef'
+        scope:
+          $ref: '#/components/schemas/CredentialScope'
+        injection:
+          $ref: '#/components/schemas/CredentialInjection'
+      additionalProperties: false
+
+    CredentialBindingMutationRequest:
+      allOf:
+        - $ref: '#/components/schemas/CredentialBinding'
+      description: Runtime add or replace request. Credential values are write-only and are never returned.
+
+    CredentialBindingMetadata:
+      type: object
+      required: [name, revision]
+      properties:
+        name:
+          type: string
+        revision:
+          type: integer
+        templateRef:
+          $ref: '#/components/schemas/CredentialBindingTemplateRef'
         scope:
           $ref: '#/components/schemas/CredentialScope'
         injection:
@@ -291,7 +357,7 @@ components:
         value:
           type: string
           writeOnly: true
-          description: Inline ephemeral credential value accepted only at sandbox creation time. This is the default and only public MVP credential input. Never returned, logged, or persisted as plaintext.
+          description: Inline ephemeral credential value accepted at sandbox creation time or through authorized runtime credential mutation APIs. This is the default and only public MVP credential input. Never returned, logged, or persisted as plaintext.
       additionalProperties: false
 
     CredentialScope:
@@ -352,7 +418,9 @@ Validation rules:
 - `templateRef.params` is for non-sensitive values only and may be logged in validation errors.
 - `sourceRef` and `credential` both carry inline ephemeral credential material. Since inline ephemeral is the only public MVP credential input, no `type` discriminator is required.
 - Sandbox creators cannot define arbitrary templates in `CreateSandboxRequest`; they can only reference built-in or operator-configured templates.
-- The server expands templates before egress validation, ambiguity checks, and runtime bootstrap.
+- The server expands templates before egress validation, ambiguity checks, runtime bootstrap, or runtime mutation delivery.
+- Runtime mutation APIs require lifecycle API authentication and sandbox-level authorization. Sandbox application containers must not receive credentials that allow them to call these APIs.
+- Runtime mutation APIs return only `CredentialBindingMetadata` and the acknowledged `revision`; they never return credential source values.
 
 Example full binding request:
 
@@ -567,8 +635,8 @@ Template safety rules:
 
 The MVP exposes one public credential input: an inline ephemeral value.
 
-- Available for cases where a caller or upper-layer platform creates a sandbox-scoped credential at sandbox creation time.
-- The inline value is accepted only in `CreateSandboxRequest`.
+- Available for cases where a caller or upper-layer platform creates a sandbox-scoped credential at sandbox creation time or adds one to an already-running sandbox through the runtime mutation API.
+- The inline value is accepted only in `CreateSandboxRequest` and authorized runtime credential mutation requests.
 - Because inline ephemeral is the only public MVP credential input, callers do not declare a `type`.
 - The OpenSandbox server must treat the value as write-only: do not return it in lifecycle responses, do not persist it as plaintext, and redact it from logs and validation errors.
 - The server converts the value into sandbox-scoped runtime credential material for the egress sidecar / Credential Proxy.
@@ -589,6 +657,50 @@ Example:
 Kubernetes Secret is not a user-facing credential source in the MVP. In Kubernetes runtime, it may be used only as a sandbox-scoped runtime delivery mechanism generated by OpenSandbox, mounted only into the egress sidecar, and owned/cleaned up with the sandbox. Sandbox creators cannot reference arbitrary pre-existing Kubernetes Secret names.
 
 Future providers may include HashiCorp Vault, Infisical, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault, internal credential brokers, and a Kubernetes Secret provider. Adding any user-selectable source provider requires a separate authorization model, namespace/scope policy, allowlists/selectors, requester authorization, and source-to-destination constraints.
+
+### Runtime Credential Mutations
+
+The MVP supports adding, replacing, deleting, and listing credential binding metadata for a running sandbox. These APIs are lifecycle control-plane APIs, not sandbox-local APIs.
+
+Supported operations:
+
+- `GET /sandboxes/{sandbox_id}/credential-vault/bindings`: returns sanitized binding metadata and the current acknowledged revision.
+- `POST /sandboxes/{sandbox_id}/credential-vault/bindings`: adds a new sandbox-local binding name.
+- `PUT /sandboxes/{sandbox_id}/credential-vault/bindings/{binding_name}`: replaces the full binding for an existing sandbox-local binding name.
+- `DELETE /sandboxes/{sandbox_id}/credential-vault/bindings/{binding_name}`: removes a binding and stops future injection for matching requests.
+
+Mutation rules:
+
+- The target sandbox must exist and be in a state where its runtime can accept credential proxy updates. Stopped or deleted sandboxes reject runtime mutation requests.
+- The caller must be authorized to mutate credentials for the target sandbox. Application containers must not receive this authorization.
+- Add and replace requests use the same `CredentialBinding` shape as creation-time bindings.
+- Add requests fail if the binding name already exists. Replace requests fail if the binding name does not exist, unless a future upsert mode is explicitly added.
+- Delete requests are idempotent only if the API contract explicitly chooses that behavior; the MVP should return `404` for unknown binding names to surface caller mistakes.
+- The server validates expanded targets against the sandbox's current `networkPolicy.egress`. Runtime mutation does not widen network reachability; callers must update egress policy through a separate, explicitly authorized API if such an API exists.
+- The server runs ambiguity checks against the complete post-mutation binding set. If the new set can produce multiple matching bindings without deterministic precedence, the mutation fails.
+- The server rejects scopes that require transparent MITM intercept ports not configured for the sandbox runtime.
+- The server rejects mutations for targets that match `ignore_hosts`.
+
+Revision and acknowledgement:
+
+- Each accepted mutation candidate receives a monotonically increasing sandbox-local `credentialVault.revision`.
+- The server prepares sandbox-scoped runtime material, sends the complete sanitized binding set and source material handles to Credential Proxy, and waits for an acknowledgement for that revision.
+- Credential Proxy validates and loads the revision into an immutable in-memory snapshot, then atomically swaps the active snapshot.
+- The API returns success only after Credential Proxy acknowledges the revision. The response includes the acknowledged revision and sanitized binding metadata.
+- If Credential Proxy is unavailable, rejects the update, or times out, the server must not report success. The previous acknowledged revision remains active.
+- If the server already persisted pending mutation metadata before delivery, it must mark the mutation as failed or roll it back before returning an error so lifecycle responses do not claim an inactive binding.
+
+Request handling during mutation:
+
+- Requests already being processed may complete using the snapshot that was active when evaluation started.
+- New requests after the proxy acknowledges a revision must use the new snapshot.
+- Deleting a binding stops future injection after acknowledgement. It does not attempt to revoke credentials already sent to an upstream service in prior requests.
+
+Runtime material cleanup:
+
+- On replace, old runtime credential material must be removed after the new revision is acknowledged.
+- On delete, runtime credential material for that binding must be removed after the delete revision is acknowledged.
+- On sandbox deletion, all runtime credential material and pending mutation state must be cleaned up.
 
 ### Credential Injection
 
@@ -692,6 +804,9 @@ Suggested audit log fields:
 
 - `sandbox_id`
 - `credential_binding`
+- `credential_vault_revision`
+- `operation` (`create`, `runtime_add`, `runtime_replace`, `runtime_delete`, `inject`)
+- `actor_id` for control-plane mutations when available
 - `source_type`
 - `target_host`
 - `method`
@@ -707,6 +822,8 @@ Suggested metrics:
 - `opensandbox_credential_proxy_injections_total`
 - `opensandbox_credential_proxy_denials_total`
 - `opensandbox_credential_proxy_source_errors_total`
+- `opensandbox_credential_vault_mutations_total`
+- `opensandbox_credential_vault_mutation_failures_total`
 - `opensandbox_credential_proxy_request_duration_seconds`
 
 All diagnostics APIs that surface runtime logs must preserve redaction behavior.
@@ -717,26 +834,33 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 
 - Add `credentialVault` schemas to `specs/sandbox-lifecycle.yml`.
 - Add examples for sandbox creation with credential bindings.
-- Consider a future `credential-proxy-api.yaml` only if runtime policy inspection/mutation is exposed separately from the egress API.
+- Add runtime credential binding mutation APIs for listing, adding, replacing, and deleting sandbox-local bindings.
+- Add examples for runtime add, replace, and delete flows, including acknowledged revision responses and failed proxy acknowledgement errors.
 
 #### Server
 
 - Add config model for `[credential_vault]`.
 - Add write-only inline credential material handling for sandbox creation.
 - Validate `CreateSandboxRequest.credentialVault`.
+- Add runtime mutation handlers for `credentialVault.bindings` list, add, replace, and delete.
 - Load built-in and operator-configured binding templates.
-- Expand template bindings into full bindings before egress validation and runtime bootstrap.
+- Expand template bindings into full bindings before egress validation, runtime bootstrap, and runtime mutation delivery.
 - Require and validate `networkPolicy.egress` for credential-enabled sandboxes.
 - Persist credential binding metadata without plaintext credential values.
-- Resolve or prepare sandbox-scoped credential material during sandbox creation.
+- Resolve or prepare sandbox-scoped credential material during sandbox creation and runtime mutation.
+- Maintain sandbox-local credential vault revisions and return success only after Credential Proxy acknowledges the target revision.
+- Roll back or mark failed any mutation metadata that cannot be delivered to Credential Proxy.
 - Redact inline credential values from request logging, validation errors, persisted metadata, and lifecycle responses.
 - Enable egress transparent mitmproxy, egress API auth, and credential addon bootstrap for Docker and Kubernetes runtimes when bindings are present.
+- Audit runtime credential mutation attempts with caller identity, binding name, revision, operation, and decision, without credential values.
 
 #### Components / Egress
 
 - Extend `components/egress` transparent mitmproxy support with a first-party credential addon.
 - Keep transparent MITM redirect ports configurable. The default credential-enabled intercept set is `80/443`; additional ports require explicit operator configuration and matching redirect rules.
 - Load credential binding bootstrap config into the egress sidecar.
+- Expose a control-plane-only credential binding reload path protected by egress API auth.
+- Apply runtime binding revisions through immutable snapshots and atomic swap; keep the previous acknowledged revision active on reload failure.
 - Implement binding evaluation, header injection, redaction, and audit events in the mitm addon path.
 - Keep the existing system addon behavior for streaming.
 - Reject sandbox-supplied mitm addon loading for credential-enabled sandboxes. Operator-configured trusted addons may run as part of the platform trust boundary.
@@ -750,6 +874,7 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - For inline credentials, optionally create a generated sandbox-scoped Kubernetes Secret mounted only into the egress sidecar.
 - Generated runtime Secrets must use labels and `ownerReferences` when possible; finalizers are reserved for cleanup that Kubernetes garbage collection cannot cover.
 - Kubernetes Secrets are runtime delivery artifacts only in the MVP; they are not user-facing credential sources.
+- Runtime add and replace operations may create or rotate generated sandbox-scoped Secrets; delete operations must remove unused generated Secrets after the proxy acknowledges the delete revision.
 - Ensure Credential Proxy has no broad Kubernetes API permissions by default.
 - Ensure the mitmproxy CA is trusted by the sandbox application container when HTTPS interception is enabled.
 - Ensure generated egress API auth material is available only to the control plane and egress sidecar, not the application container.
@@ -759,13 +884,14 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 
 - Enable the egress sidecar with transparent mitmproxy sharing the sandbox network namespace.
 - Ensure the mitmproxy CA is trusted by the sandbox application container when HTTPS interception is enabled.
-- Clean up sidecar and sandbox-scoped credential material when the sandbox is deleted.
+- Create, rotate, and clean up sandbox-scoped credential material for runtime add, replace, delete, and sandbox deletion.
 - Ensure generated egress API auth material is not exposed to the application container.
 - Start or release the sandbox application container only after the egress sidecar readiness signal is ready for credential-enabled sandboxes.
 
 #### SDKs and CLI
 
 - Add typed request models for credential bindings.
+- Add client helpers for runtime credential binding list, add, replace, and delete.
 - Add typed request models for template references and credential values.
 - Add examples for common providers such as GitHub and model APIs.
 - Add examples for `git-https-basic` and enterprise operator-configured Git templates.
@@ -787,8 +913,11 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - Existing headers with the injection name are replaced or rejected according to the selected implementation rule.
 - Redaction removes credential values from logs and errors.
 - Response redaction removes known credential values from response headers and supported text bodies.
-- Inline credential `value` is accepted only as write-only create input and never appears in serialized sandbox metadata or API responses.
+- Inline credential `value` is accepted only as write-only create or runtime mutation input and never appears in serialized sandbox metadata or API responses.
 - Egress validation requires `networkPolicy.egress` and catches binding targets not allowed by policy.
+- Runtime add rejects duplicate binding names, replace rejects unknown binding names, and delete returns the documented response for unknown binding names.
+- Runtime mutations reject post-mutation binding sets that create ambiguous matches.
+- Runtime mutation revision handling keeps the previous acknowledged revision active when proxy acknowledgement fails.
 - Operator-configured templates reject repo paths outside allowed prefixes.
 
 ### Integration Tests
@@ -797,6 +926,11 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - Docker sandbox cannot read credential value from environment variables, mounted files, lifecycle API response, or diagnostics.
 - Kubernetes sandbox with inline ephemeral source creates sandbox-scoped runtime material mounted only into the egress sidecar and cleans it up on sandbox deletion.
 - Kubernetes runtime rejects requests that try to reference arbitrary pre-existing Kubernetes Secret names as credential sources.
+- Running Docker and Kubernetes sandboxes can add an inline ephemeral credential binding through the lifecycle API, receive an acknowledged revision, and use it for subsequent matching requests.
+- Running Docker and Kubernetes sandboxes can replace a credential binding and observe that subsequent requests use the replacement while prior credential material is cleaned up.
+- Running Docker and Kubernetes sandboxes can delete a credential binding and observe that subsequent matching requests no longer receive injected credentials.
+- Runtime mutation requests fail without activating partial metadata when Credential Proxy acknowledgement fails or times out.
+- Sandbox application containers cannot call runtime credential mutation APIs or access the egress API token used for proxy reload.
 - Credential Proxy denies non-matching hosts, paths, and methods.
 - Credential-enabled sandbox creation/readiness fails when transparent redirect, mitm readiness, CA bootstrap, credential addon loading, or egress API auth cannot be configured.
 - Credential-enabled sandbox code cannot run before the egress sidecar readiness signal is ready.
@@ -812,6 +946,9 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 ### E2E Tests
 
 - Create a sandbox with `networkPolicy.defaultAction=deny`, allow `api.github.com`, bind a read-only GitHub credential, and verify a normal `https://api.github.com/...` call succeeds through Credential Proxy.
+- Create a sandbox without initial credential bindings, add a read-only GitHub credential at runtime, and verify subsequent normal `https://api.github.com/...` calls succeed through Credential Proxy.
+- Replace the runtime GitHub credential with an invalid value and verify subsequent matching requests fail authentication without exposing either credential in logs or lifecycle responses.
+- Delete the runtime GitHub credential binding and verify subsequent matching requests are not credentialed.
 - Create a sandbox with a `git-https-basic` template, run `git clone https://code.alibaba-inc.com/foo/bar.git`, and verify the injected Basic auth succeeds without credentials in the URL.
 - Verify direct access to a non-allowed domain fails under egress policy.
 - Verify logs and diagnostic APIs never contain the credential string.
@@ -822,6 +959,7 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 
 - Requires enabling transparent MITM for credential-bearing HTTP/HTTPS traffic.
 - Adds a new control-plane surface and a credential-aware path inside egress.
+- Runtime credential mutation adds revision, acknowledgement, rollback, and cleanup complexity to the lifecycle control plane and egress sidecar.
 - Requires stricter startup behavior than ordinary egress policy; credential-enabled sandboxes fail closed instead of gracefully degrading when transparent interception is unavailable.
 - Keeps MITM addons inside the operator/platform trust boundary; sandbox-supplied addons remain unsupported for credential-enabled sandboxes.
 - Cannot provide an absolute secrecy guarantee against arbitrary upstream services that echo credentials in unsupported response encodings or protocols.
@@ -860,6 +998,7 @@ Allowing sandbox creators to define arbitrary templates inline would reduce serv
 - No new Credential Proxy component image for the MVP; Credential Proxy is implemented in the existing egress image through transparent mitmproxy and a first-party credential addon.
 - Server configuration for binding templates and optional operator-managed credential backing stores used by those templates.
 - Kubernetes permission to create/delete sandbox-scoped runtime Secrets when inline credentials are enabled for Kubernetes runtime.
+- A control-plane-to-egress reload path for runtime binding revisions, protected by egress API authentication and unavailable to application containers.
 - CI tests for Docker and Kubernetes runtime paths.
 - Documentation and examples for common credential binding patterns.
 - Documentation for built-in binding templates and operator-configured templates.
@@ -875,8 +1014,9 @@ Recommended rollout:
 
 1. Add schema and server validation behind `[credential_vault].enabled = false` by default.
 2. Extend egress transparent mitmproxy with credential addon support and inline credential bootstrap.
-3. Implement Kubernetes egress sidecar credential bootstrap using sandbox-scoped runtime material.
-4. Add SDK models and CLI examples.
-5. Document production guidance: use `networkPolicy.defaultAction=deny`, keep credential targets narrow, avoid broad methods and paths, and monitor audit events.
+3. Add runtime credential mutation APIs, revision tracking, proxy acknowledgement, and rollback semantics.
+4. Implement Kubernetes egress sidecar credential bootstrap and runtime rotation using sandbox-scoped runtime material.
+5. Add SDK models and CLI examples.
+6. Document production guidance: use `networkPolicy.defaultAction=deny`, keep credential targets narrow, avoid broad methods and paths, and monitor audit events.
 
-No migration is required for existing users. Users currently injecting secrets through environment variables can gradually migrate by passing sandbox-scoped inline credentials at creation time, or by using platform-provided binding templates that hide operator-managed credentials behind platform authorization.
+No migration is required for existing users. Users currently injecting secrets through environment variables can gradually migrate by passing sandbox-scoped inline credentials at creation time, adding them at runtime through authorized control-plane APIs, or by using platform-provided binding templates that hide operator-managed credentials behind platform authorization.
