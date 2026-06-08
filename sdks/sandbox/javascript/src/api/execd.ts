@@ -863,7 +863,7 @@ export interface components {
         /** @description Content replacement operation */
         ReplaceFileContentItem: {
             /**
-             * @description String to be replaced
+             * @description String to be replaced (must not be empty)
              * @example localhost
              */
             old: string;
